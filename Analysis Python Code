@@ -1,0 +1,134 @@
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+import pandas as pd
+import numpy as np
+
+# Load dataset (assuming already saved)
+df = pd.read_csv("C:/Users/USER/Downloads/kenya_election_2027_dataset.csv")
+np.random.seed(42)
+
+# Define features
+features = ['Turnout_2022', 'Youth_Pop_2027', 'Unemployment_2022', 'Urbanization',
+            'Sentiment_Ruto_2024_2025', 'Sentiment_UOA_2024_2025', 'Sentiment_Maraga_Omtatah_2024_2025',
+            'KIEMS_Failure_2022']
+
+# Adjust vote shares with new sentiment weights
+def adjust_vote_shares(row):
+    ruto_share = row['Ruto_Share_2022']
+    odinga_share = row['Odinga_Share_2022']
+    
+    # Adjust Ruto's share: -20% for negative sentiment
+    if row['Sentiment_Ruto_2024_2025'] == -1:
+        ruto_share *= 0.80  # Increased penalty
+    elif row['Sentiment_Ruto_2024_2025'] == 1:
+        ruto_share *= 1.05  # Reduced boost, reflecting skepticism
+    # Stronger penalty in Rift Valley counties
+    rift_valley = ['Uasin Gishu', 'Nakuru', 'Kericho', 'Nandi', 'Baringo', 'Elgeyo Marakwet']
+    if row['County'] in rift_valley and row['Sentiment_Ruto_2024_2025'] == -1:
+        ruto_share *= 0.75  # Additional 25% penalty
+    
+    # Boost UOA in Matiang'i strongholds
+    uoa_share = odinga_share * 0.7 if row['Sentiment_UOA_2024_2025'] == 1 else odinga_share * 0.5
+    if row['County'] in ['Kisii', 'Nyamira']:  # Matiang'i's Gusii base
+        uoa_share = odinga_share * 0.85
+    elif row['County'] in ['Kisumu', 'Siaya', 'Homa Bay']:  # Partial Nyanza split
+        uoa_share = odinga_share * 0.65
+    
+    # Maraga/Omtatah retains niche support
+    maraga_omtatah_share = odinga_share * 0.3 if row['Sentiment_Maraga_Omtatah_2024_2025'] == 1 else odinga_share * 0.2
+    if row['County'] in ['Kisii', 'Nyamira', 'Busia']:
+        maraga_omtatah_share = odinga_share * 0.4
+    
+    # Normalize to sum to 1
+    total = ruto_share + uoa_share + maraga_omtatah_share
+    if total > 1:
+        ruto_share /= total
+        uoa_share /= total
+        maraga_omtatah_share /= total
+    
+    return pd.Series({'Ruto_Share_2027': ruto_share, 'UOA_Share_2027': uoa_share, 'Maraga_Omtatah_Share_2027': maraga_omtatah_share})
+
+# Apply adjustments
+df[['Ruto_Share_2027', 'UOA_Share_2027', 'Maraga_Omtatah_Share_2027']] = df.apply(adjust_vote_shares, axis=1)
+
+# Train Random Forest models
+models = {}
+for candidate in ['Ruto_Share_2027', 'UOA_Share_2027', 'Maraga_Omtatah_Share_2027']:
+    X = df[features]
+    y = df[candidate]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train)
+    models[candidate] = model
+    print(f'{candidate} MSE: {mean_squared_error(y_test, model.predict(X_test)):.4f}')
+
+# Predict vote shares
+df['Ruto_Share_Pred'] = models['Ruto_Share_2027'].predict(df[features])
+df['UOA_Share_Pred'] = models['UOA_Share_2027'].predict(df[features])
+df['Maraga_Omtatah_Share_Pred'] = models['Maraga_Omtatah_Share_2027'].predict(df[features])
+
+# Normalize predictions
+total_shares = df['Ruto_Share_Pred'] + df['UOA_Share_Pred'] + df['Maraga_Omtatah_Share_Pred']
+df['Ruto_Share_Pred'] /= total_shares
+df['UOA_Share_Pred'] /= total_shares
+df['Maraga_Omtatah_Share_Pred'] /= total_shares
+
+# Save updated dataset
+df.to_csv('kenya_election_2027_updated.csv', index=False)
+
+# Show sample predictions
+print("\nSample Predicted Vote Shares:")
+print(df[['County', 'Ruto_Share_Pred', 'UOA_Share_Pred', 'Maraga_Omtatah_Share_Pred']].head(10))
+
+# Calculate base case vote shares
+total_voters = df['Registered_Voters_2022'].sum()
+df['Ruto_Votes'] = df['Ruto_Share_Pred'] * df['Registered_Voters_2022'] * df['Turnout_2022']
+df['UOA_Votes'] = df['UOA_Share_Pred'] * df['Registered_Voters_2022'] * df['Turnout_2022']
+df['Maraga_Omtatah_Votes'] = df['Maraga_Omtatah_Share_Pred'] * df['Registered_Voters_2022'] * df['Turnout_2022']
+
+national_shares = {
+    'Ruto': df['Ruto_Votes'].sum() / df['Registered_Voters_2022'].mul(df['Turnout_2022']).sum(),
+    'UOA': df['UOA_Votes'].sum() / df['Registered_Voters_2022'].mul(df['Turnout_2022']).sum(),
+    'Maraga/Omtatah': df['Maraga_Omtatah_Votes'].sum() / df['Registered_Voters_2022'].mul(df['Turnout_2022']).sum()
+}
+
+# High youth turnout scenario
+df_high_turnout = df.copy()
+urban_counties = ['Nairobi', 'Mombasa', 'Kisumu', 'Kakamega', 'Machakos']
+df_high_turnout.loc[df_high_turnout['County'].isin(urban_counties), 'Turnout_2022'] = 0.75
+df_high_turnout['Ruto_Votes'] = df_high_turnout['Ruto_Share_Pred'] * df_high_turnout['Registered_Voters_2022'] * df_high_turnout['Turnout_2022']
+df_high_turnout['UOA_Votes'] = df_high_turnout['UOA_Share_Pred'] * df_high_turnout['Registered_Voters_2022'] * df_high_turnout['Turnout_2022']
+df_high_turnout['Maraga_Omtatah_Votes'] = df_high_turnout['Maraga_Omtatah_Share_Pred'] * df_high_turnout['Registered_Voters_2022'] * df_high_turnout['Turnout_2022']
+
+national_shares_high = {
+    'Ruto': df_high_turnout['Ruto_Votes'].sum() / df_high_turnout['Registered_Voters_2022'].mul(df_high_turnout['Turnout_2022']).sum(),
+    'UOA': df_high_turnout['UOA_Votes'].sum() / df_high_turnout['Registered_Voters_2022'].mul(df_high_turnout['Turnout_2022']).sum(),
+    'Maraga/Omtatah': df_high_turnout['Maraga_Omtatah_Votes'].sum() / df_high_turnout['Registered_Voters_2022'].mul(df_high_turnout['Turnout_2022']).sum()
+}
+
+# Count counties with 25%+ votes
+ruto_counties_25 = len(df[df['Ruto_Share_Pred'] >= 0.25])
+uoa_counties_25 = len(df[df['UOA_Share_Pred'] >= 0.25])
+maraga_omtatah_counties_25 = len(df[df['Maraga_Omtatah_Share_Pred'] >= 0.25])
+
+# Print results
+print("National Vote Shares (Base Case):")
+print({k: f"{v*100:.1f}%" for k, v in national_shares.items()})
+print("\nNational Vote Shares (High Youth Turnout):")
+print({k: f"{v*100:.1f}%" for k, v in national_shares_high.items()})
+print("\nCounties with 25%+ Votes:")
+print(f"Ruto: {ruto_counties_25}, UOA: {uoa_counties_25}, Maraga/Omtatah: {maraga_omtatah_counties_25}")
+
+# Check for winner
+winner = max(national_shares, key=national_shares.get)
+if national_shares[winner] > 0.5 and locals()[f'{winner.lower().replace("/", "_")}_counties_25'] >= 24:
+    print(f"\nWinner (Base Case): {winner} with {national_shares[winner]*100:.1f}%")
+else:
+    print("\nBase Case: No candidate meets 50%+ and 25% in 24+ counties. Runoff likely.")
+
+winner_high = max(national_shares_high, key=national_shares_high.get)
+if national_shares_high[winner_high] > 0.5 and locals()[f'{winner_high.lower().replace("/", "_")}_counties_25'] >= 24:
+    print(f"Winner (High Youth Turnout): {winner_high} with {national_shares_high[winner_high]*100:.1f}%")
+else:
+    print("High Youth Turnout: No candidate meets 50%+ and 25% in 24+ counties. Runoff likely.")
